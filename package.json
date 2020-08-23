@@ -1,0 +1,16 @@
+{
+  "name": "ts-async-queue-processor",
+  "version": "1.0.0",
+  "description": "",
+  "main": "index.js",
+  "scripts": {
+    "test": "ts-node testing.ts"
+  },
+  "author": "Petteri Parikka",
+  "license": "MIT",
+  "devDependencies": {
+    "@types/node": "^14.6.0",
+    "ts-node": "^9.0.0",
+    "typescript": "^4.0.2"
+  }
+}
