@@ -1,88 +1,126 @@
 import { Transform } from 'stream';
+import { performance } from 'perf_hooks';
 
 interface processor {
-  activeWorkers: number,
+  activeWorkers: number;
+  limiter: limiter | null;
   queue: WorkItem[];
 }
 
 interface WorkItem {
+  priority: number;
   task: (param?: any) => Promise<any>;
   resolve: (result: any) => any;
-  reject: (err: any) => any
+  reject: (err: any) => any;
 }
 
-/**
- * Processes async tasks in a FIFO manner using a configurable amount of concurrency and pending tasks.
- * can be used for critical sections when maxConcurrency = 1.
- *
- * usage:
- * const processor = new AsyncProcessor({
- *  maxConcurrency: 1,
- *  maxPending: 10
- * });
- *
- * const newFoo = await processor.process('foo', async () => {
- *  const foo = await getFoo();
- *  const bar = await getBar();
- *  foo.bar = bar;
- *  await save(foo);
- *  return foo;
- * });
- */
-export class AsyncQueueProcessor {
+interface QueueProcessor {
+  process<T>(task: () => Promise<T>): Promise<T>;
+  data<T>(iter: Iterable<T>): DataProcessor<T>;
+}
+
+interface ProcessorOpts {
+  maxConcurrency?: number;
+  maxPending?: number;
+  rateLimit?: LimiterOpts
+}
+
+interface LimiterOpts {
+  limit: [number, 'second' | 'minute'],
+  tickRate?: number;
+  burst?: boolean;
+}
+
+interface ProcessOpts {
+  key?: string;
+  proprity?: number;
+}
+
+export class AsyncQueueProcessor implements QueueProcessor {
   private maxConcurrency: number;
   private maxPending: number;
   private limitPending: boolean;
   private processors: Record<string, processor | undefined> = {};
 
-  public constructor(opts?: { maxConcurrency?: number; maxPending?: number }) {
+  public constructor(private opts?: ProcessorOpts) {
     this.maxConcurrency = opts?.maxConcurrency ?? 1;
-    this.maxPending = opts?.maxPending ?? 0;
+    this.maxPending = opts?.maxPending ?? Number.MAX_SAFE_INTEGER;
     this.limitPending = this.maxPending !== 0;
   }
 
-  public processMany<T>(key: string, tasks: Array<() => Promise<T>>): Promise<T[]> {
-    return Promise.all(tasks.map((task) => this.process(key, task)));
+  public pipe(child: QueueProcessor) {
+    return new PipedProcessor(this, child);
   }
 
-  public process<T>(key: string, task: () => Promise<T>): Promise<T> {
+  public with(opts: ProcessOpts) {
+    return new ProcessorWithOpts(opts, this);
+  }
+
+  public processMany<T>(tasks: Array<() => Promise<T>>): Promise<T[]> {
+    return this.processManyWith(tasks);
+  }
+
+  public processManyWith<T>(tasks: Array<() => Promise<T>>, opts?: ProcessOpts): Promise<T[]> {
+    return Promise.all(tasks.map((task) => this.processWith(task, opts)));
+  }
+
+  public process<T>(task: () => Promise<T>): Promise<T> {
+    return this.processWith(task);
+  }
+
+  public processWith<T>(task: () => Promise<T>, opts?: ProcessOpts): Promise<T> {
+    const key = opts?.key ?? '__default__';
+    const priority = opts?.proprity ?? Number.MIN_SAFE_INTEGER;
+
     if (this.limitPending && (this.processors[key]?.queue?.length ?? 0) >= this.maxPending) {
       return Promise.reject('pending');
     }
+
     return new Promise<T>((resolve, reject) => {
-      this.enqueueWork(key, {task, resolve, reject});
+      this.enqueueWork(key, {task, resolve, reject, priority});
     });
   }
 
   // TODO
-  public streamTransform<T, E>(key: string, task: (input: T) => Promise<E>): Transform {
+  // public streamTransform<T, E>(key: string, task: (input: T) => Promise<E>): Transform {
 
-    function streamTask(chunk: T) {
-      return task(chunk);
-    }
+  //   function streamTask(chunk: T) {
+  //     return task(chunk);
+  //   }
 
-    const self = this;
-    return new Transform({
-      transform(chunk: T, enc, callback) {
-        // TODO can we hoist this? Maybe share a single WorkItem for all transform invocations.
-        const work: WorkItem = {
-          task: streamTask,
-          resolve: (output: E) => callback(null, output),
-          reject: () => callback(new Error('pass error here'))
-        }
-        self.enqueueWork(key, work);
-      }
-    });
+  //   const self = this;
+  //   return new Transform({
+  //     transform(chunk: T, enc, callback) {
+  //       // TODO can we hoist this? Maybe share a single WorkItem for all transform invocations.
+  //       const work: WorkItem = {
+  //         task: streamTask,
+  //         resolve: (output: E) => callback(null, output),
+  //         reject: () => callback(new Error('pass error here'))
+  //       }
+  //       self.enqueueWork(key, work);
+  //     }
+  //   });
+  // }
+
+  public generate<T>(iter: AsyncGenerator<T>) {
+    return new DataProcessor(this, iter);
+  }
+
+  public data<T>(iter: Iterable<T>): DataProcessor<T> {
+    async function* source() { yield* iter; }
+    return new DataProcessor(this, source());
   }
 
   private enqueueWork(key: string, work: WorkItem) {
     if (!this.processors[key]) {
       this.processors[key] = {
         activeWorkers: 0,
+        limiter: (this.opts?.rateLimit) ? getLimiter(this.opts.rateLimit) : null,
         queue: [work]
       };
     } else {
       this.processors[key]!.queue.push(work);
+      this.processors[key]?.queue.sort((a, b) => b.priority - a.priority);
     }
     if (this.processors[key]!.activeWorkers < this.maxConcurrency) {
       void this.startProcessor(key);
@@ -98,6 +136,7 @@ export class AsyncQueueProcessor {
     while (nextWork = processor.queue.shift()) {
       const {task, resolve, reject} = nextWork;
       try {
+        if (processor.limiter) await processor.limiter.next();
         resolve(await task());
       } catch (err) {
         reject(err);
@@ -109,4 +148,183 @@ export class AsyncQueueProcessor {
       delete this.processors[key];
     }
   }
+}
+
+class ProcessorWithOpts implements QueueProcessor {
+  private opts: ProcessOpts = {};
+  constructor(opts: ProcessOpts, private parentProcessor: AsyncQueueProcessor) {
+    Object.assign(this.opts, opts);
+  }
+
+  data<T>(iter: Iterable<T>): DataProcessor<T> {
+    async function* source() { yield* iter; }
+    return new DataProcessor(this, source());
+  }
+
+  public with(opts: ProcessOpts) {
+    return new ProcessorWithOpts(opts, this.parentProcessor);
+  }
+
+  public processMany<T>(tasks: (() => Promise<T>)[]): Promise<T[]> {
+    return this.parentProcessor.processManyWith(tasks, this.opts)
+  }
+
+  public process<T>(task: () => Promise<T>): Promise<T> {
+    return this.parentProcessor.processWith(task, this.opts)
+  }
+}
+
+class PipedProcessor implements QueueProcessor {
+  constructor(private parentProcessor: QueueProcessor, private childProcessor: QueueProcessor) { }
+
+  data<T>(iter: Iterable<T>): DataProcessor<T> {
+    async function* source() { yield* iter; }
+    return new DataProcessor(this, source());
+  }
+
+  public process<T>(task: () => Promise<T>): Promise<T> {
+    return this.parentProcessor.process(() => {
+      return this.childProcessor.process(task);
+    })
+  }
+
+  generate<T>(): AsyncGenerator<T, any, unknown> {
+    throw new Error('Method not implemented.');
+  }
+}
+
+type predicate<T> = (element: T, index?: number) => Promise<boolean>;
+type mapper<T, E> = (element: T, index?: number) => Promise<E>;
+type flatmapper<T, E> = (element: T, index?: number) => Promise<E[]>;
+type func<T> = (element: T, index?: number) => any;
+
+interface DataProcessorOpts {
+  buffer?: number;
+  rateLimit: LimiterOpts;
+}
+export class DataProcessor<T> {
+
+  // TODO implement buffering
+  private buffer: any[] = [];
+  private limiter: limiter | null = null;
+
+  public constructor(private parent: QueueProcessor, private data: AsyncGenerator<T>, private opts?: DataProcessorOpts) {
+    if (this.opts?.rateLimit) {
+      this.limiter = getLimiter(this.opts.rateLimit);
+    }
+  }
+
+  // public static intercolate(...nums: number[]) {
+  //   return new DataProcessor(this.parent, this._filter(predicate));
+  // }
+
+  async toArray(): Promise<T[]> {
+    const arr = [];
+    for await (const d of this.data) {
+      arr.push(d);
+    }
+    return arr;
+  }
+
+  pipe(nextProcessor: QueueProcessor) {
+    return new DataProcessor(nextProcessor, this.data);
+  }
+
+  filter(predicate: predicate<T>) {
+    return new DataProcessor(this.parent, this._filter(predicate));
+  }
+
+  map<E>(mapper: mapper<T, E>, opts?: DataProcessorOpts) {
+    return new DataProcessor(this.parent, this._map(mapper), opts);
+  }
+
+  flatMap<E>(flatMapper: flatmapper<T, E>) {
+    return new DataProcessor(this.parent, this._flatMap(flatMapper));
+  }
+
+  forEach(func: func<T>) {
+    return new DataProcessor(this.parent, this._forEach(func));
+  }
+
+  // TODO take, takeWhile, skip, skipWhile
+
+  async execute() {
+    for await (const _ of this.data) {}
+  }
+
+  private async* _filter(predicate: (element: T, index?: number) => Promise<boolean>) {
+    for await (const element of this.data) {
+      if (this.limiter) await this.limiter.next();
+      const passes = await this.parent.process(() => predicate(element))
+      if (passes) {
+        yield element;
+      }
+    }
+  }
+
+  private async* _map<E>(mapper: mapper<T, E>) {
+    for await (const element of this.data) {
+      if (this.limiter) await this.limiter.next();
+      yield await this.parent.process(() => mapper(element))
+    }
+  }
+
+  private async* _flatMap<E>(flatMapper: flatmapper<T, E>) {
+    for await (const element of this.data) {
+      if (this.limiter) await this.limiter.next();
+      yield* await this.parent.process(() => flatMapper(element))
+    }
+  }
+
+  private async* _forEach(func: (element: T, index?: number) => Promise<any>) {
+    for await (const element of this.data) {
+      if (this.limiter) await this.limiter.next();
+      yield this.parent.process(() => func(element))
+    }
+  }
+}
+
+type limiter = AsyncGenerator<void, void, void>;
+// Rate limiting with a token bucket.
+async function* getLimiter(opts: LimiterOpts): limiter {
+  let bucket = 1;
+  let bucketMax = 1;
+  let fillRate: number;
+  let prevFill = performance.now();
+
+  const limit = opts.limit[0];
+  if (opts.limit[1] === 'second') {
+    fillRate = 1000 / limit;
+  } else {
+    fillRate = 1000 * 60 / limit;
+  }
+
+  const tickRate = opts.tickRate ?? 0;
+  if (opts.burst) {
+    bucket = limit;
+    bucketMax = limit
+  }
+
+  function fillBucket() {
+    const now = performance.now();
+    const newTokens = Math.floor((now - prevFill) / fillRate);
+    if (newTokens > 0) {
+      bucket = Math.min(bucket + newTokens, bucketMax);
+      prevFill = now;
+    }
+  }
+
+  while(true) {
+    while (bucket > 0) {
+      bucket -= 1;
+      yield;
+    }
+    // Bucket ran out, sleep a bit and try to refill.
+    await sleep(tickRate);
+    fillBucket();
+  }
+}
+
+async function sleep(ms: number) {
+  return new Promise(res => setTimeout(res, ms));
 }
