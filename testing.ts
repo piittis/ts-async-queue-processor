@@ -9,49 +9,42 @@ async function doWork(name: string) {
   await sleep();
   console.log(name, ' done');
 }
-// get file ids
-// download stream for each file
-// pipe into http request
 
 async function testing() {
 
   const generator = new AsyncQueueProcessor({
-    maxConcurrency: 5,
-    maxPending: 100
+    maxConcurrency: 100,
+    maxPending: 100,
+    rateLimit: {
+      limit: [1, 'second']
+    }
   });
 
   const processor1 = new AsyncQueueProcessor({
-    maxConcurrency: 5,
-    maxPending: 100
+    maxConcurrency: 20,
+    maxPending: 100,
   });
 
-  const processor2 = new AsyncQueueProcessor({
-    maxConcurrency: 5,
-    maxPending: 100
-  });
-
-
-  const dbProcessor = new AsyncQueueProcessor({
-    maxConcurrency: 10,
-    // rateLimit: {limit: [15, 'second']}
-  });
-
-  const rowProcessor = new AsyncQueueProcessor({
-    maxConcurrency: 1,
-    // rateLimit: {limit: [5, 'second']}
-  });
-
-  generator
+  const a = processor1
   .data([1,2,3,4,5,6,7,8,9])
-  .pipe(processor1)
-  .map(async () => {
-    await doWork('map1');
+  .scatter(5)
+  .map(async(el) => {
+    await sleep();
+    return el;
   })
-  .pipe(processor2)
-  .map(async () => {
-    await doWork('map2');
+  // .gather()
+  .forEach((el) => {
+    console.log('forEach', el);
   })
-  .execute();
+
+  console.log(await a.toArray());
+
+  // const b = processor1
+  // .data([1,2,3,4,5,6,7,8,9])
+  // .map(async(el) => {
+  //   await sleep();
+  //   return 'p2 - ' + el.toString()
+  // })
 
   // await Promise.all([
   //   dbProcessor.pipe(rowProcessor.with({key: '1'})).process(() => doWork('1a')),

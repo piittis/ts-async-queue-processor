@@ -198,25 +198,12 @@ type mapper<T, E> = (element: T, index?: number) => Promise<E>;
 type flatmapper<T, E> = (element: T, index?: number) => Promise<E[]>;
 type func<T> = (element: T, index?: number) => any;
 
-interface DataProcessorOpts {
-  buffer?: number;
-  rateLimit: LimiterOpts;
-}
 export class DataProcessor<T> {
 
-  // TODO implement buffering
-  private buffer: any[] = [];
-  private limiter: limiter | null = null;
-
-  public constructor(private parent: QueueProcessor, private data: AsyncGenerator<T>, private opts?: DataProcessorOpts) {
-    if (this.opts?.rateLimit) {
-      this.limiter = getLimiter(this.opts.rateLimit);
-    }
+  private scatterCount: number;
+  public constructor(private parent: QueueProcessor, private data: AsyncGenerator<T>, scatterCount?: number) {
+    this.scatterCount = scatterCount ?? 1;
   }
-
-  // public static intercolate(...nums: number[]) {
-  //   return new DataProcessor(this.parent, this._filter(predicate));
-  // }
 
   async toArray(): Promise<T[]> {
     const arr = [];
@@ -226,35 +213,84 @@ export class DataProcessor<T> {
     return arr;
   }
 
+  nextProcessor<E>(data: AsyncGenerator<E>) {
+    return new DataProcessor<E>(this.parent, data, this.scatterCount);
+  }
+
   pipe(nextProcessor: QueueProcessor) {
     return new DataProcessor(nextProcessor, this.data);
   }
 
-  filter(predicate: predicate<T>) {
-    return new DataProcessor(this.parent, this._filter(predicate));
+  scatter(count: number) {
+    this.scatterCount = count;
+    return this;
   }
 
-  map<E>(mapper: mapper<T, E>, opts?: DataProcessorOpts) {
-    return new DataProcessor(this.parent, this._map(mapper), opts);
+  gather() {
+    this.scatterCount = 1;
+    return this;
+  }
+
+  filter(predicate: predicate<T>) {
+    return this.nextProcessor(this._scatter(() => this._filter(predicate)));
+  }
+
+  map<E>(mapper: mapper<T, E>) {
+    return this.nextProcessor(this._scatter(() => this._map(mapper)));
   }
 
   flatMap<E>(flatMapper: flatmapper<T, E>) {
-    return new DataProcessor(this.parent, this._flatMap(flatMapper));
+    return this.nextProcessor(this._scatter(() => this._flatMap(flatMapper)));
   }
 
   forEach(func: func<T>) {
-    return new DataProcessor(this.parent, this._forEach(func));
+    return this.nextProcessor(this._scatter(() => this._forEach(func)));
+  }
+
+  take(count: number) {
+    return this.nextProcessor(this._scatter(() => this._take(count)));
+  }
+
+  skip(count: number) {
+    return this.nextProcessor(this._scatter(() => this._skip(count)));
   }
 
   // TODO take, takeWhile, skip, skipWhile
-
   async execute() {
     for await (const _ of this.data) {}
   }
 
+  private _scatter<T>(source: () => AsyncGenerator<T>): AsyncGenerator<T> {
+    if (this.scatterCount === 1) {
+      return source();
+    }
+    const generators: AsyncGenerator<T>[] = [];
+    for (let i = 0; i < this.scatterCount; i++) {
+      generators.push(source());
+    }
+    return this.combine(generators);
+  }
+
+  private async* combine<T>(generators: AsyncGenerator<T>[]): AsyncGenerator<T> {
+    const toPromise = (origin: AsyncGenerator<any>) =>
+      ({ origin, promise: origin.next().then(result => ({origin, result}))});
+
+    let sources = generators.map(toPromise);
+    while(sources.length > 0) {
+      // Get next available value.
+      const next = await Promise.race(sources.map(s => s.promise));
+      // Remove from sources.
+      sources = sources.filter(s => s.origin !== next.origin);
+      if (!next.result.done) {
+        // If more to come, add back to sources.
+        sources.push(toPromise(next.origin));
+        yield next.result.value;
+      }
+    }
+  }
+
   private async* _filter(predicate: (element: T, index?: number) => Promise<boolean>) {
     for await (const element of this.data) {
-      if (this.limiter) await this.limiter.next();
       const passes = await this.parent.process(() => predicate(element))
       if (passes) {
         yield element;
@@ -263,23 +299,57 @@ export class DataProcessor<T> {
   }
 
   private async* _map<E>(mapper: mapper<T, E>) {
+    console.log("_map")
     for await (const element of this.data) {
-      if (this.limiter) await this.limiter.next();
-      yield await this.parent.process(() => mapper(element))
+      yield await this.parent.process(() => mapper(element));
     }
   }
 
   private async* _flatMap<E>(flatMapper: flatmapper<T, E>) {
     for await (const element of this.data) {
-      if (this.limiter) await this.limiter.next();
-      yield* await this.parent.process(() => flatMapper(element))
+      yield* await this.parent.process(() => flatMapper(element));
     }
   }
 
   private async* _forEach(func: (element: T, index?: number) => Promise<any>) {
     for await (const element of this.data) {
-      if (this.limiter) await this.limiter.next();
-      yield this.parent.process(() => func(element))
+      this.parent.process(() => func(element));
+      yield element;
+    }
+  }
+
+  private async* _take(count: number) {
+    for (let i = 0; i < count; i++) {
+      const next = await this.data.next();
+      yield next.value;
+      if (next.done === true) {
+        break;
+      }
+    }
+  }
+
+  private async* _skip(count: number) {
+    for (let i = 0; i < count; i++) {
+      const next = await this.data.next();
+      if (next.done === true) {
+        break;
+      }
+    }
+    yield* this.data;
+  }
+
+  private async* _takeWhile(predicate: (element: T, index?: number) => Promise<boolean>) {
+    while(true) {
+      const next = await this.data.next();
+      const passes = await this.parent.process(() => predicate(next.value));
+      if (passes) {
+        yield next.value
+      } else {
+        break;
+      }
+      if (next.done === true) {
+        break;
+      }
     }
   }
 }
