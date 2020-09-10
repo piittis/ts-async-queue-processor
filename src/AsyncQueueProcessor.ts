@@ -16,11 +16,11 @@ interface WorkItem {
 
 interface QueueProcessor {
   process<T>(task: () => Promise<T>): Promise<T>;
-  data<T>(iter: Iterable<T>): DataProcessor<T>;
+  data<T>(iter: Iterable<T>): Pipeline<T>;
 }
 
 interface ProcessorOpts {
-  maxConcurrency?: number;
+  concurrency?: number;
   maxPending?: number;
   rateLimit?: LimiterOpts
 }
@@ -29,10 +29,11 @@ interface LimiterOpts {
   limit: [number, 'second' | 'minute'],
   tickRate?: number;
   burst?: boolean;
+  burstSlots?: number;
 }
 
 interface ProcessOpts {
-  key?: string;
+  key?: string | number;
   proprity?: number;
 }
 
@@ -40,10 +41,10 @@ export class AsyncQueueProcessor implements QueueProcessor {
   private maxConcurrency: number;
   private maxPending: number;
   private limitPending: boolean;
-  private processors: Record<string, processor | undefined> = {};
+  private processors: Record<string | number, processor | undefined> = {};
 
   public constructor(private opts?: ProcessorOpts) {
-    this.maxConcurrency = opts?.maxConcurrency ?? 1;
+    this.maxConcurrency = opts?.concurrency ?? 1;
     this.maxPending = opts?.maxPending ?? Number.MAX_SAFE_INTEGER;
     this.limitPending = this.maxPending !== 0;
   }
@@ -102,16 +103,16 @@ export class AsyncQueueProcessor implements QueueProcessor {
   //   });
   // }
 
-  public generate<T>(iter: AsyncGenerator<T>) {
-    return new DataProcessor(this, iter);
+  public generate<T>(iter: AsyncGenerator<T>): Pipeline<T> {
+    return new Pipeline(this, iter);
   }
 
-  public data<T>(iter: Iterable<T>): DataProcessor<T> {
+  public data<T>(iter: Iterable<T>): Pipeline<T> {
     async function* source() { yield* iter; }
-    return new DataProcessor(this, source());
+    return new Pipeline(this, source());
   }
 
-  private enqueueWork(key: string, work: WorkItem) {
+  private enqueueWork(key: string | number, work: WorkItem) {
     if (!this.processors[key]) {
       this.processors[key] = {
         activeWorkers: 0,
@@ -127,7 +128,7 @@ export class AsyncQueueProcessor implements QueueProcessor {
     }
   }
 
-  private async startProcessor(key: string) {
+  private async startProcessor(key: string | number) {
     const processor = this.processors[key];
     if (!processor) return;
     processor.activeWorkers += 1;
@@ -156,9 +157,13 @@ class ProcessorWithOpts implements QueueProcessor {
     Object.assign(this.opts, opts);
   }
 
-  data<T>(iter: Iterable<T>): DataProcessor<T> {
+  data<T>(iter: Iterable<T>): Pipeline<T> {
     async function* source() { yield* iter; }
-    return new DataProcessor(this, source());
+    return new Pipeline(this, source());
+  }
+
+  public pipe(child: QueueProcessor) {
+    return new PipedProcessor(this, child);
   }
 
   public with(opts: ProcessOpts) {
@@ -177,9 +182,13 @@ class ProcessorWithOpts implements QueueProcessor {
 class PipedProcessor implements QueueProcessor {
   constructor(private parentProcessor: QueueProcessor, private childProcessor: QueueProcessor) { }
 
-  data<T>(iter: Iterable<T>): DataProcessor<T> {
+  data<T>(iter: Iterable<T>): Pipeline<T> {
     async function* source() { yield* iter; }
-    return new DataProcessor(this, source());
+    return new Pipeline(this, source());
+  }
+
+  public pipe(child: QueueProcessor) {
+    return new PipedProcessor(this, child);
   }
 
   public process<T>(task: () => Promise<T>): Promise<T> {
@@ -194,13 +203,18 @@ class PipedProcessor implements QueueProcessor {
 }
 
 type predicate<T> = (element: T, index?: number) => Promise<boolean>;
+type syncPredicate<T> = (element: T, index?: number) => boolean;
 type mapper<T, E> = (element: T, index?: number) => Promise<E>;
+type syncMapper<T, E> = (element: T, index?: number) => E;
 type flatmapper<T, E> = (element: T, index?: number) => Promise<E[]>;
+type syncFlatmapper<T, E> = (element: T, index?: number) => E[];
 type func<T> = (element: T, index?: number) => any;
 
-export class DataProcessor<T> {
+export class Pipeline<T> {
 
   private scatterCount: number;
+  private index = 0;
+
   public constructor(private parent: QueueProcessor, private data: AsyncGenerator<T>, scatterCount?: number) {
     this.scatterCount = scatterCount ?? 1;
   }
@@ -214,11 +228,11 @@ export class DataProcessor<T> {
   }
 
   nextProcessor<E>(data: AsyncGenerator<E>) {
-    return new DataProcessor<E>(this.parent, data, this.scatterCount);
+    return new Pipeline<E>(this.parent, data, this.scatterCount);
   }
 
   pipe(nextProcessor: QueueProcessor) {
-    return new DataProcessor(nextProcessor, this.data);
+    return new Pipeline(nextProcessor, this.data);
   }
 
   scatter(count: number) {
@@ -235,16 +249,32 @@ export class DataProcessor<T> {
     return this.nextProcessor(this._scatter(() => this._filter(predicate)));
   }
 
+  filterSync(predicate: syncPredicate<T>) {
+    return this.nextProcessor(this._filterSync(predicate));
+  }
+
   map<E>(mapper: mapper<T, E>) {
     return this.nextProcessor(this._scatter(() => this._map(mapper)));
+  }
+
+  mapSync<E>(mapper: syncMapper<T, E>) {
+    return this.nextProcessor(this._mapSync(mapper));
   }
 
   flatMap<E>(flatMapper: flatmapper<T, E>) {
     return this.nextProcessor(this._scatter(() => this._flatMap(flatMapper)));
   }
 
+  flatMapSync<E>(flatMapper: syncFlatmapper<T, E>) {
+    return this.nextProcessor(this._flatMapSync(flatMapper));
+  }
+
   forEach(func: func<T>) {
     return this.nextProcessor(this._scatter(() => this._forEach(func)));
+  }
+
+  forEachSync(func: func<T>) {
+    return this.nextProcessor(this._forEachSync(func));
   }
 
   take(count: number) {
@@ -255,7 +285,6 @@ export class DataProcessor<T> {
     return this.nextProcessor(this._scatter(() => this._skip(count)));
   }
 
-  // TODO take, takeWhile, skip, skipWhile
   async execute() {
     for await (const _ of this.data) {}
   }
@@ -271,6 +300,9 @@ export class DataProcessor<T> {
     return this.combine(generators);
   }
 
+  /**
+   * Combine the output of multiple async generators
+   */
   private async* combine<T>(generators: AsyncGenerator<T>[]): AsyncGenerator<T> {
     const toPromise = (origin: AsyncGenerator<any>) =>
       ({ origin, promise: origin.next().then(result => ({origin, result}))});
@@ -291,29 +323,54 @@ export class DataProcessor<T> {
 
   private async* _filter(predicate: (element: T, index?: number) => Promise<boolean>) {
     for await (const element of this.data) {
-      const passes = await this.parent.process(() => predicate(element))
-      if (passes) {
+      if (await this.parent.process(() => predicate(element, this.index++))) {
+        yield element;
+      }
+    }
+  }
+
+  private async* _filterSync(predicate: syncPredicate<T>) {
+    for await (const element of this.data) {
+      if (predicate(element, this.index++)) {
         yield element;
       }
     }
   }
 
   private async* _map<E>(mapper: mapper<T, E>) {
-    console.log("_map")
     for await (const element of this.data) {
-      yield await this.parent.process(() => mapper(element));
+      yield await this.parent.process(() => mapper(element, this.index++));
+    }
+  }
+
+  private async* _mapSync<E>(mapper: syncMapper<T, E>) {
+    for await (const element of this.data) {
+      yield mapper(element, this.index++);
     }
   }
 
   private async* _flatMap<E>(flatMapper: flatmapper<T, E>) {
     for await (const element of this.data) {
-      yield* await this.parent.process(() => flatMapper(element));
+      yield* await this.parent.process(() => flatMapper(element, this.index++));
+    }
+  }
+
+  private async* _flatMapSync<E>(flatMapper: syncFlatmapper<T, E>) {
+    for await (const element of this.data) {
+      yield* flatMapper(element, this.index++);
     }
   }
 
   private async* _forEach(func: (element: T, index?: number) => Promise<any>) {
     for await (const element of this.data) {
-      this.parent.process(() => func(element));
+      this.parent.process(() => func(element, this.index++));
+      yield element;
+    }
+  }
+
+  private async* _forEachSync(func: (element: T, index?: number) => any) {
+    for await (const element of this.data) {
+      func(element, this.index++);
       yield element;
     }
   }
@@ -343,9 +400,7 @@ export class DataProcessor<T> {
       const next = await this.data.next();
       const passes = await this.parent.process(() => predicate(next.value));
       if (passes) {
-        yield next.value
-      } else {
-        break;
+        yield next.value;
       }
       if (next.done === true) {
         break;
@@ -355,10 +410,10 @@ export class DataProcessor<T> {
 }
 
 type limiter = AsyncGenerator<void, void, void>;
-// Rate limiting with a token bucket.
+// Rate limiting in token bucket style.
 async function* getLimiter(opts: LimiterOpts): limiter {
-  let bucket = 1;
-  let bucketMax = 1;
+  let slots = 1;
+  let maxSlots = 1;
   let fillRate: number;
   let prevFill = performance.now();
 
@@ -371,27 +426,27 @@ async function* getLimiter(opts: LimiterOpts): limiter {
 
   const tickRate = opts.tickRate ?? 0;
   if (opts.burst) {
-    bucket = limit;
-    bucketMax = limit
+    slots = limit;
+    maxSlots = opts.burstSlots ?? limit;
   }
 
-  function fillBucket() {
+  function fillSlots() {
     const now = performance.now();
-    const newTokens = Math.floor((now - prevFill) / fillRate);
-    if (newTokens > 0) {
-      bucket = Math.min(bucket + newTokens, bucketMax);
+    const newSlots = Math.floor((now - prevFill) / fillRate);
+    if (newSlots > 0) {
+      slots = Math.min(slots + newSlots, maxSlots);
       prevFill = now;
     }
   }
 
   while(true) {
-    while (bucket > 0) {
-      bucket -= 1;
+    while (slots > 0) {
       yield;
+      slots -= 1;
     }
     // Bucket ran out, sleep a bit and try to refill.
     await sleep(tickRate);
-    fillBucket();
+    fillSlots();
   }
 }
 
