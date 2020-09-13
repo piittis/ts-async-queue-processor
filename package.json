@@ -4,13 +4,16 @@
   "description": "",
   "main": "index.js",
   "scripts": {
-    "test": "ts-node testing.ts"
+    "test": "ts-node testing.ts",
+    "doc": "typedoc --excludePrivate --excludeExternals --stripInternal --excludeNotExported --readme none --out docs src"
   },
   "author": "Petteri Parikka",
   "license": "MIT",
   "devDependencies": {
-    "@types/node": "^14.6.0",
-    "ts-node": "^9.0.0",
-    "typescript": "^4.0.2"
-  }
+    "@types/node": "14.6.0",
+    "ts-node": "9.0.0",
+    "typedoc": "0.19.1",
+    "typescript": "4.0.2"
+  },
+  "dependencies": {}
 }

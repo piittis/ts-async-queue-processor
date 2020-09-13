@@ -6,33 +6,28 @@ function sleep () {
 
 async function testing() {
 
-  // console.log(await a.toArray());
-  const p1 = Pipeline.from([1,2,3])
+  const p1 = Pipeline.from(['a','b','c','d','e','f','g','h','i','j'])
+  .scatterOrdered(3)
   .map(async (el) => {
-    await sleep();
-    return el;
-  })
-
-  const p2 = Pipeline.from(['a','b','c','d'])
-  .map(async (el) => {
+    // console.log('start', el)
     await sleep()
     return el
   })
-  .chunk(2)
 
-  const p3 = Pipeline.from([false, true, false, true, false, true, false, true, false])
-  .chunk(2)
+  const p2 = Pipeline.from([false, true, false, true, false, true, false, true, false])
+  .scatterOrdered(3)
   .map(async (el) => {
+    // console.log('start', el)
     await sleep()
     return el;
   });
 
-  const foo = Pipeline
-    .interleave(p1, p2, p3)
-    .forEach((el) => {
-      console.log(el);
-    }).execute();
+  await Pipeline.interleave(p1, p2)
+  .tap((el) => {
+    console.log(el)
+  }).execute();
 
+  // await p2.tap((el) => console.log(el)).execute();
   return;
 
 

@@ -14,29 +14,27 @@ interface WorkItem {
   reject: (err: any) => any;
 }
 
-interface QueueProcessor {
+export interface QueueProcessor {
   process<T>(task: () => Promise<T>): Promise<T>;
 }
 
-interface ProcessorOpts {
+export interface ProcessorOpts {
   concurrency?: number;
   maxPending?: number;
   rateLimit?: LimiterOpts
 }
 
-interface LimiterOpts {
+export interface LimiterOpts {
   limit: [number, 'second' | 'minute'],
   tickRate?: number;
   burst?: boolean;
   burstSlots?: number;
 }
 
-interface ProcessOpts {
+export interface ProcessOpts {
   key?: string | number;
   proprity?: number;
 }
-
-type task<T> = () => Promise<T>;
 
 export class AsyncQueueProcessor implements QueueProcessor {
   private maxConcurrency: number;
@@ -131,8 +129,6 @@ export class AsyncQueueProcessor implements QueueProcessor {
   }
 }
 
-type pipelineUnion<T extends Pipeline<any>[]> = T[number] extends Pipeline<infer R> ? R : T
-
 class ProcessorWithOpts implements QueueProcessor {
   private opts: ProcessOpts = {};
   constructor(opts: ProcessOpts, private parentProcessor: AsyncQueueProcessor) {
@@ -170,18 +166,29 @@ class PipedProcessor implements QueueProcessor {
   }
 }
 
-type predicate<T> = (element: T, index?: number) => Promise<boolean>;
-type syncPredicate<T> = (element: T, index?: number) => boolean;
-type mapper<T, E> = (element: T, index?: number) => Promise<E>;
-type syncMapper<T, E> = (element: T, index?: number) => E;
-type flatmapper<T, E> = (element: T, index?: number) => Promise<E[]>;
-type syncFlatmapper<T, E> = (element: T, index?: number) => E[];
-type func<T> = (element: T, index?: number) => any;
+
+export type predicate<T> = (element: T, index?: number) => Promise<boolean>;
+export type syncPredicate<T> = (element: T, index?: number) => boolean;
+export type mapper<T, E> = (element: T, index?: number) => Promise<E>;
+export type syncMapper<T, E> = (element: T, index?: number) => E;
+export type flatmapper<T, E> = (element: T, index?: number) => Promise<E[]>;
+export type syncFlatmapper<T, E> = (element: T, index?: number) => E[];
+export type func<T> = (element: T, index?: number) => any;
+
+/**
+ * Pipeline combinators accept arbitrary pipelines and must return
+ * a pipeline that is an union of them:
+ * Array<(Pipeline<number> | Pipeline<string>)> -> combinator -> Pipeline<number | string>
+ * extractUnion is used infer what the type parameter of the combined pipeline should be.
+ */
+type anyPipelines = Pipeline<any>[];
+type extractUnion<T extends Pipeline<any>[]> = T[number] extends Pipeline<infer R> ? R : never;
 
 type maybeProcessor = QueueProcessor | null;
-interface PipelineOpts {
+export interface PipelineOpts {
   processor: maybeProcessor;
   scatterCount: number;
+  scatterOrdered: boolean;
 }
 
 export class Pipeline<T> {
@@ -191,7 +198,7 @@ export class Pipeline<T> {
   private index = 0;
 
   public constructor(private data: AsyncIterable<T>, opts?: PipelineOpts) {
-    this.opts = opts ?? { processor: null, scatterCount: 1 };
+    this.opts = opts ?? { processor: null, scatterCount: 1, scatterOrdered: false };
     this.processor = this.opts.processor;
   }
 
@@ -212,65 +219,20 @@ export class Pipeline<T> {
     return new Pipeline(AsyncIterable);
   }
 
-  public static combine<E extends Pipeline<any>[]>(...pipelines: E): Pipeline<pipelineUnion<E>> {
-    const sources = pipelines.map(p =>
-      async function*() {
-        yield* p.toIterable()
-      }()
-    );
-    const source = this._combine(sources)
-    return new Pipeline(source);
+  public static combine<E extends anyPipelines>(...pipelines: E): Pipeline<extractUnion<E>> {
+    return new Pipeline(this._combineData(pipelines));
   }
 
-  public static concat<E extends Pipeline<any>[]>(...pipelines: E): Pipeline<pipelineUnion<E>> {
-    const source = async function*() {
-      for (const pl of pipelines) {
-        yield* pl.toIterable()
-      }
-    }
-    return new Pipeline(source());
+  public static concat<E extends anyPipelines>(...pipelines: E): Pipeline<extractUnion<E>> {
+    return new Pipeline(this._concatData(pipelines));
   }
 
-  public static interleave<E extends Pipeline<any>[]>(...pipelines: E): Pipeline<pipelineUnion<E>> {
-    let iterators = pipelines
-      .map(pl => pl.toIterable()[Symbol.asyncIterator]());
-
-    const source = async function*() {
-      while(iterators.length > 0) {
-        for (const origin of iterators) {
-          const next = await origin.next();
-          if (!next.done) {
-            yield next.value;
-          } else {
-            iterators = iterators.filter(it => it !== origin);
-          }
-        }
-      }
-    }
-    return new Pipeline(source());
+  public static interleave<E extends anyPipelines>(...pipelines: E): Pipeline<extractUnion<E>> {
+    return new Pipeline(this._interleaveData(pipelines));
   }
 
-  public static zip<E extends Pipeline<any>[]>(...pipelines: E): Pipeline<pipelineUnion<E>[]> {
-    let iterators = pipelines
-      .map(pl => pl.toIterable()[Symbol.asyncIterator]());
-
-    const source = async function*() {
-      while(iterators.length > 0) {
-        const buffer = [];
-        for (const origin of iterators) {
-          const next = await origin.next();
-          if (!next.done) {
-            buffer.push(next.value)
-          } else {
-            iterators = iterators.filter(it => it !== origin);
-          }
-        }
-        if (buffer.length > 0) {
-          yield buffer;
-        }
-      }
-    }
-    return new Pipeline(source());
+  public static zip<E extends anyPipelines>(...pipelines: E): Pipeline<extractUnion<E>[]> {
+    return new Pipeline(this._zipData(pipelines));
   }
 
   public toIterable(): AsyncIterable<T> {
@@ -287,8 +249,21 @@ export class Pipeline<T> {
     return this;
   }
 
+  public unPipe() {
+    this.opts.processor = null;
+    this.processor = null;
+    return this;
+  }
+
   public scatter(count: number) {
     this.opts.scatterCount = count;
+    this.opts.scatterOrdered = false;
+    return this;
+  }
+
+  public scatterOrdered(count: number) {
+    this.opts.scatterCount = count;
+    this.opts.scatterOrdered = true;
     return this;
   }
 
@@ -325,8 +300,8 @@ export class Pipeline<T> {
     return this._next(this._scatter(() => this._forEach(func)));
   }
 
-  public forEachSync(func: func<T>) {
-    return this._next(this._forEachSync(func));
+  public tap(func: func<T>) {
+    return this._next(this._tap(func));
   }
 
   public take(count: number) {
@@ -349,11 +324,47 @@ export class Pipeline<T> {
     return new Pipeline<E>(data, {...this.opts});
   }
 
-  private async _process<E>(task: task<E>) {
+  private async _process<E>(task: () => Promise<E>) {
     if (this.processor) {
       return this.processor.process(task);
     } else {
       return task();
+    }
+  }
+
+  private static _combineData(pipelines: Pipeline<any>[]) {
+    let iterators = pipelines.map(pl => pl.toIterable()[Symbol.asyncIterator]());
+    return this._combine(iterators)
+  }
+
+  private static async *_concatData(pipelines: Pipeline<any>[]): AsyncIterable<any> {
+    for (const pl of pipelines) {
+      yield* pl.toIterable();
+    }
+  }
+
+  private static _interleaveData(pipelines: Pipeline<any>[]): AsyncIterable<any> {
+    let iterators = pipelines.map(pl => pl.toIterable()[Symbol.asyncIterator]());
+    return Pipeline._combineOrdred(iterators);
+  }
+
+  private static async *_zipData(pipelines: Pipeline<any>[]): AsyncIterable<any> {
+    let iterators = pipelines
+      .map(pl => pl.toIterable()[Symbol.asyncIterator]());
+
+    while(iterators.length > 0) {
+      const buffer = [];
+      for (const origin of iterators) {
+        const next = await origin.next();
+        if (!next.done) {
+          buffer.push(next.value)
+        } else {
+          iterators = iterators.filter(it => it !== origin);
+        }
+      }
+      if (buffer.length > 0) {
+        yield buffer;
+      }
     }
   }
 
@@ -365,18 +376,18 @@ export class Pipeline<T> {
     for (let i = 0; i < this.opts.scatterCount; i++) {
       generators.push(source());
     }
-    return Pipeline._combine(generators);
+    if (this.opts.scatterOrdered) {
+      return Pipeline._combineOrdred(generators);
+    } else {
+      return Pipeline._combine(generators);
+    }
   }
 
-  /**
-   * Combine the output of multiple async generators
-   */
-  public static async* _combine<T>(generators: AsyncGenerator<T>[]): AsyncGenerator<T> {
-
-    const toPromise = (origin: AsyncGenerator<any>) =>
+  private static async* _combine<T>(iterators: AsyncIterator<T>[]): AsyncGenerator<T> {
+    const toPromise = (origin: AsyncIterator<any>) =>
       ({ origin, promise: origin.next().then(result => ({origin, result}))});
 
-    let sources = generators.map(toPromise);
+    let sources = iterators.map(toPromise);
     while(sources.length > 0) {
       // Get next available value from any source.
       const next = await Promise.race(sources.map(s => s.promise));
@@ -387,6 +398,27 @@ export class Pipeline<T> {
         sources.push(toPromise(next.origin));
         yield next.result.value;
       }
+    }
+  }
+
+  private static async* _combineOrdred<T>(iterators: AsyncIterator<T>[]): AsyncGenerator<T> {
+    const toPromise = (origin: AsyncIterator<any>) =>
+      ({ origin, exhausted: false, result: origin.next()});
+
+    // Start fetching the first value of each iterator.
+    let sources = iterators.map(toPromise);
+    while(sources.length > 0) {
+      for (const source of sources) {
+        const next = await source.result;
+        if (!next.done) {
+          // More to come.
+          source.result = source.origin.next();
+          yield next.value;
+        } else {
+          source.exhausted = true;
+        }
+      }
+      sources = sources.filter(s => !s.exhausted);
     }
   }
 
@@ -437,7 +469,7 @@ export class Pipeline<T> {
     }
   }
 
-  private async* _forEachSync(func: (element: T, index?: number) => any) {
+  private async* _tap(func: (element: T, index?: number) => any) {
     for await (const element of this.data) {
       func(element, this.index++);
       yield element;
@@ -467,16 +499,6 @@ export class Pipeline<T> {
     }
   }
 
-  private async* _takeWhile(predicate: (element: T, index?: number) => Promise<boolean>) {
-    for await (const element of this.data) {
-      if (await this._process(() => predicate(element))) {
-        yield element;
-      } else {
-        break;
-      }
-    }
-  }
-
   private async* _chunk(count: number) {
     let buffer: T[] = [];
     for await (const element of this.data) {
@@ -491,6 +513,7 @@ export class Pipeline<T> {
     }
   }
 }
+
 
 type limiter = AsyncGenerator<void, void, void>;
 // Rate limiting in token bucket style.
