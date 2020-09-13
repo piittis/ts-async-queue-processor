@@ -1,4 +1,4 @@
-import { Transform } from 'stream';
+import { Readable } from 'stream';
 import { performance } from 'perf_hooks';
 
 interface processor {
@@ -16,7 +16,6 @@ interface WorkItem {
 
 interface QueueProcessor {
   process<T>(task: () => Promise<T>): Promise<T>;
-  data<T>(iter: Iterable<T>): Pipeline<T>;
 }
 
 interface ProcessorOpts {
@@ -36,6 +35,8 @@ interface ProcessOpts {
   key?: string | number;
   proprity?: number;
 }
+
+type task<T> = () => Promise<T>;
 
 export class AsyncQueueProcessor implements QueueProcessor {
   private maxConcurrency: number;
@@ -82,34 +83,13 @@ export class AsyncQueueProcessor implements QueueProcessor {
     });
   }
 
-  // TODO
-  // public streamTransform<T, E>(key: string, task: (input: T) => Promise<E>): Transform {
-
-  //   function streamTask(chunk: T) {
-  //     return task(chunk);
-  //   }
-
-  //   const self = this;
-  //   return new Transform({
-  //     transform(chunk: T, enc, callback) {
-  //       // TODO can we hoist this? Maybe share a single WorkItem for all transform invocations.
-  //       const work: WorkItem = {
-  //         task: streamTask,
-  //         resolve: (output: E) => callback(null, output),
-  //         reject: () => callback(new Error('pass error here'))
-  //       }
-  //       self.enqueueWork(key, work);
-  //     }
-  //   });
-  // }
-
-  public generate<T>(iter: AsyncGenerator<T>): Pipeline<T> {
-    return new Pipeline(this, iter);
+  public pipelineAsync<T>(iterable: AsyncIterable<T>): Pipeline<T> {
+    return new Pipeline(iterable);
   }
 
-  public data<T>(iter: Iterable<T>): Pipeline<T> {
-    async function* source() { yield* iter; }
-    return new Pipeline(this, source());
+  public pipeline<T>(iterable: Iterable<T>): Pipeline<T> {
+    async function* source() { yield* iterable; }
+    return new Pipeline(source());
   }
 
   private enqueueWork(key: string | number, work: WorkItem) {
@@ -151,15 +131,12 @@ export class AsyncQueueProcessor implements QueueProcessor {
   }
 }
 
+type pipelineUnion<T extends Pipeline<any>[]> = T[number] extends Pipeline<infer R> ? R : T
+
 class ProcessorWithOpts implements QueueProcessor {
   private opts: ProcessOpts = {};
   constructor(opts: ProcessOpts, private parentProcessor: AsyncQueueProcessor) {
     Object.assign(this.opts, opts);
-  }
-
-  data<T>(iter: Iterable<T>): Pipeline<T> {
-    async function* source() { yield* iter; }
-    return new Pipeline(this, source());
   }
 
   public pipe(child: QueueProcessor) {
@@ -182,11 +159,6 @@ class ProcessorWithOpts implements QueueProcessor {
 class PipedProcessor implements QueueProcessor {
   constructor(private parentProcessor: QueueProcessor, private childProcessor: QueueProcessor) { }
 
-  data<T>(iter: Iterable<T>): Pipeline<T> {
-    async function* source() { yield* iter; }
-    return new Pipeline(this, source());
-  }
-
   public pipe(child: QueueProcessor) {
     return new PipedProcessor(this, child);
   }
@@ -195,10 +167,6 @@ class PipedProcessor implements QueueProcessor {
     return this.parentProcessor.process(() => {
       return this.childProcessor.process(task);
     })
-  }
-
-  generate<T>(): AsyncGenerator<T, any, unknown> {
-    throw new Error('Method not implemented.');
   }
 }
 
@@ -210,16 +178,24 @@ type flatmapper<T, E> = (element: T, index?: number) => Promise<E[]>;
 type syncFlatmapper<T, E> = (element: T, index?: number) => E[];
 type func<T> = (element: T, index?: number) => any;
 
+type maybeProcessor = QueueProcessor | null;
+interface PipelineOpts {
+  processor: maybeProcessor;
+  scatterCount: number;
+}
+
 export class Pipeline<T> {
 
-  private scatterCount: number;
+  private opts: PipelineOpts;
+  private processor: maybeProcessor;
   private index = 0;
 
-  public constructor(private parent: QueueProcessor, private data: AsyncGenerator<T>, scatterCount?: number) {
-    this.scatterCount = scatterCount ?? 1;
+  public constructor(private data: AsyncIterable<T>, opts?: PipelineOpts) {
+    this.opts = opts ?? { processor: null, scatterCount: 1 };
+    this.processor = this.opts.processor;
   }
 
-  async toArray(): Promise<T[]> {
+  public async toArray(): Promise<T[]> {
     const arr = [];
     for await (const d of this.data) {
       arr.push(d);
@@ -227,91 +203,184 @@ export class Pipeline<T> {
     return arr;
   }
 
-  nextProcessor<E>(data: AsyncGenerator<E>) {
-    return new Pipeline<E>(this.parent, data, this.scatterCount);
+  public static from<E>(iterable: Iterable<E>) {
+    async function* source() { yield* iterable; }
+    return new Pipeline(source());
   }
 
-  pipe(nextProcessor: QueueProcessor) {
-    return new Pipeline(nextProcessor, this.data);
+  public static fromAsync<E>(AsyncIterable: AsyncIterable<E>) {
+    return new Pipeline(AsyncIterable);
   }
 
-  scatter(count: number) {
-    this.scatterCount = count;
+  public static combine<E extends Pipeline<any>[]>(...pipelines: E): Pipeline<pipelineUnion<E>> {
+    const sources = pipelines.map(p =>
+      async function*() {
+        yield* p.toIterable()
+      }()
+    );
+    const source = this._combine(sources)
+    return new Pipeline(source);
+  }
+
+  public static concat<E extends Pipeline<any>[]>(...pipelines: E): Pipeline<pipelineUnion<E>> {
+    const source = async function*() {
+      for (const pl of pipelines) {
+        yield* pl.toIterable()
+      }
+    }
+    return new Pipeline(source());
+  }
+
+  public static interleave<E extends Pipeline<any>[]>(...pipelines: E): Pipeline<pipelineUnion<E>> {
+    let iterators = pipelines
+      .map(pl => pl.toIterable()[Symbol.asyncIterator]());
+
+    const source = async function*() {
+      while(iterators.length > 0) {
+        for (const origin of iterators) {
+          const next = await origin.next();
+          if (!next.done) {
+            yield next.value;
+          } else {
+            iterators = iterators.filter(it => it !== origin);
+          }
+        }
+      }
+    }
+    return new Pipeline(source());
+  }
+
+  public static zip<E extends Pipeline<any>[]>(...pipelines: E): Pipeline<pipelineUnion<E>[]> {
+    let iterators = pipelines
+      .map(pl => pl.toIterable()[Symbol.asyncIterator]());
+
+    const source = async function*() {
+      while(iterators.length > 0) {
+        const buffer = [];
+        for (const origin of iterators) {
+          const next = await origin.next();
+          if (!next.done) {
+            buffer.push(next.value)
+          } else {
+            iterators = iterators.filter(it => it !== origin);
+          }
+        }
+        if (buffer.length > 0) {
+          yield buffer;
+        }
+      }
+    }
+    return new Pipeline(source());
+  }
+
+  public toIterable(): AsyncIterable<T> {
+    return this.data;
+  }
+
+  public toStream(): Readable {
+    return Readable.from(this.data);
+  }
+
+  public pipe(processor: QueueProcessor) {
+    this.opts.processor = processor;
+    this.processor = processor;
     return this;
   }
 
-  gather() {
-    this.scatterCount = 1;
+  public scatter(count: number) {
+    this.opts.scatterCount = count;
     return this;
   }
 
-  filter(predicate: predicate<T>) {
-    return this.nextProcessor(this._scatter(() => this._filter(predicate)));
+  public gather() {
+    this.opts.scatterCount = 1;
+    return this;
   }
 
-  filterSync(predicate: syncPredicate<T>) {
-    return this.nextProcessor(this._filterSync(predicate));
+  public filter(predicate: predicate<T>) {
+    return this._next(this._scatter(() => this._filter(predicate)));
   }
 
-  map<E>(mapper: mapper<T, E>) {
-    return this.nextProcessor(this._scatter(() => this._map(mapper)));
+  public filterSync(predicate: syncPredicate<T>) {
+    return this._next(this._filterSync(predicate));
   }
 
-  mapSync<E>(mapper: syncMapper<T, E>) {
-    return this.nextProcessor(this._mapSync(mapper));
+  public map<E>(mapper: mapper<T, E>) {
+    return this._next(this._scatter(() => this._map(mapper)));
   }
 
-  flatMap<E>(flatMapper: flatmapper<T, E>) {
-    return this.nextProcessor(this._scatter(() => this._flatMap(flatMapper)));
+  public mapSync<E>(mapper: syncMapper<T, E>) {
+    return this._next(this._mapSync(mapper));
   }
 
-  flatMapSync<E>(flatMapper: syncFlatmapper<T, E>) {
-    return this.nextProcessor(this._flatMapSync(flatMapper));
+  public flatMap<E>(flatMapper: flatmapper<T, E>) {
+    return this._next(this._scatter(() => this._flatMap(flatMapper)));
   }
 
-  forEach(func: func<T>) {
-    return this.nextProcessor(this._scatter(() => this._forEach(func)));
+  public flatMapSync<E>(flatMapper: syncFlatmapper<T, E>) {
+    return this._next(this._flatMapSync(flatMapper));
   }
 
-  forEachSync(func: func<T>) {
-    return this.nextProcessor(this._forEachSync(func));
+  public forEach(func: func<T>) {
+    return this._next(this._scatter(() => this._forEach(func)));
   }
 
-  take(count: number) {
-    return this.nextProcessor(this._scatter(() => this._take(count)));
+  public forEachSync(func: func<T>) {
+    return this._next(this._forEachSync(func));
   }
 
-  skip(count: number) {
-    return this.nextProcessor(this._scatter(() => this._skip(count)));
+  public take(count: number) {
+    return this._next(this._scatter(() => this._take(count)));
   }
 
-  async execute() {
+  public skip(count: number) {
+    return this._next(this._scatter(() => this._skip(count)));
+  }
+
+  public chunk(count: number) {
+    return this._next(this._chunk(count))
+  }
+
+  public async execute() {
     for await (const _ of this.data) {}
   }
 
+  private _next<E>(data: AsyncGenerator<E>) {
+    return new Pipeline<E>(data, {...this.opts});
+  }
+
+  private async _process<E>(task: task<E>) {
+    if (this.processor) {
+      return this.processor.process(task);
+    } else {
+      return task();
+    }
+  }
+
   private _scatter<T>(source: () => AsyncGenerator<T>): AsyncGenerator<T> {
-    if (this.scatterCount === 1) {
+    if (this.opts.scatterCount === 1) {
       return source();
     }
     const generators: AsyncGenerator<T>[] = [];
-    for (let i = 0; i < this.scatterCount; i++) {
+    for (let i = 0; i < this.opts.scatterCount; i++) {
       generators.push(source());
     }
-    return this.combine(generators);
+    return Pipeline._combine(generators);
   }
 
   /**
    * Combine the output of multiple async generators
    */
-  private async* combine<T>(generators: AsyncGenerator<T>[]): AsyncGenerator<T> {
+  public static async* _combine<T>(generators: AsyncGenerator<T>[]): AsyncGenerator<T> {
+
     const toPromise = (origin: AsyncGenerator<any>) =>
       ({ origin, promise: origin.next().then(result => ({origin, result}))});
 
     let sources = generators.map(toPromise);
     while(sources.length > 0) {
-      // Get next available value.
+      // Get next available value from any source.
       const next = await Promise.race(sources.map(s => s.promise));
-      // Remove from sources.
+      // Remove the source that produced a value.
       sources = sources.filter(s => s.origin !== next.origin);
       if (!next.result.done) {
         // If more to come, add back to sources.
@@ -323,7 +392,7 @@ export class Pipeline<T> {
 
   private async* _filter(predicate: (element: T, index?: number) => Promise<boolean>) {
     for await (const element of this.data) {
-      if (await this.parent.process(() => predicate(element, this.index++))) {
+      if (await this._process(() => predicate(element, this.index++))) {
         yield element;
       }
     }
@@ -339,7 +408,7 @@ export class Pipeline<T> {
 
   private async* _map<E>(mapper: mapper<T, E>) {
     for await (const element of this.data) {
-      yield await this.parent.process(() => mapper(element, this.index++));
+      yield await this._process(() => mapper(element, this.index++));
     }
   }
 
@@ -351,7 +420,7 @@ export class Pipeline<T> {
 
   private async* _flatMap<E>(flatMapper: flatmapper<T, E>) {
     for await (const element of this.data) {
-      yield* await this.parent.process(() => flatMapper(element, this.index++));
+      yield* await this._process(() => flatMapper(element, this.index++));
     }
   }
 
@@ -363,7 +432,7 @@ export class Pipeline<T> {
 
   private async* _forEach(func: (element: T, index?: number) => Promise<any>) {
     for await (const element of this.data) {
-      this.parent.process(() => func(element, this.index++));
+      this._process(() => func(element, this.index++));
       yield element;
     }
   }
@@ -376,35 +445,49 @@ export class Pipeline<T> {
   }
 
   private async* _take(count: number) {
-    for (let i = 0; i < count; i++) {
-      const next = await this.data.next();
-      yield next.value;
-      if (next.done === true) {
+    let taken = 0;
+    for await (const element of this.data) {
+      if (taken < count) {
+        taken++;
+        yield element;
+      } else {
         break;
       }
     }
   }
 
   private async* _skip(count: number) {
-    for (let i = 0; i < count; i++) {
-      const next = await this.data.next();
-      if (next.done === true) {
-        break;
+    let skipped = 0;
+    for await (const element of this.data) {
+      if (skipped < count) {
+        continue;
+      } else {
+        yield element;
       }
     }
-    yield* this.data;
   }
 
   private async* _takeWhile(predicate: (element: T, index?: number) => Promise<boolean>) {
-    while(true) {
-      const next = await this.data.next();
-      const passes = await this.parent.process(() => predicate(next.value));
-      if (passes) {
-        yield next.value;
-      }
-      if (next.done === true) {
+    for await (const element of this.data) {
+      if (await this._process(() => predicate(element))) {
+        yield element;
+      } else {
         break;
       }
+    }
+  }
+
+  private async* _chunk(count: number) {
+    let buffer: T[] = [];
+    for await (const element of this.data) {
+      buffer.push(element)
+      if (buffer.length >= count) {
+        yield buffer;
+        buffer = [];
+      }
+    }
+    if (buffer.length > 0) {
+      yield buffer;
     }
   }
 }

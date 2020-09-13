@@ -1,7 +1,7 @@
 # Async Queue Processor
 (status: experimental)
 
-Simple yet powerful tool for async operations. Main constructs provided are `Processor` and `Pipeline`.
+Simple but powerful tool for async operations. Constructs provided are `Processor` and `Pipeline`.
 
 ## Processor
 A Construct that allows executing async functions while placing constraints on concurrency, throughput and allowed amount of pending functions.
@@ -45,7 +45,7 @@ const tableProcessor = new AsyncQueueProcessor({concurrency: 1});
 function processRow(rowId: number) {
   // Only one concurrent access per row.
   tableProcessor.with({key: rowId}).process(async () => {
-    await doSomethingToRow(rowId);
+    await doRowTransform(rowId);
   });
 }
 ```
@@ -192,7 +192,7 @@ producer.generate(async function* () {
 
 Pipeline functions are evaluated lazily, and each element flows though one at a time from start to finish. By default there is no concurrency within a single pipeline. You can spawn multiple pipelines that can execute concurrently, while adhering to the concurrency constraints of the specified processor. Another option is to use `scatter` and `gather`.
 
-- `scatter(n: number)` will have the effect, that `n` amount of generators are spawned to produce the results of the pipeline functions that follow it. The output of the spawned generators is combined and passed on to downstream functions. Scattering allows different pipeline functions to be active concurrently, thus speeding up processing overall. If some function is slow while others are fast, the slow function can be scattered to remedy the bottleneck. Scattering a function effectively creates a buffer of `n` slots for the results of that function. Note that Element ordering is not guaranteed after scatter.
+- `scatter(n: number)` will have the effect, that `n` amount of generators are spawned to produce the results of the pipeline functions that follow it. The output of the generators is combined and passed downstream. Scattering allows different pipeline functions to be active concurrently, thus speeding up processing overall. If some function is slow while others are fast, the slow function can be scattered to remedy the bottleneck. Scattering a function effectively creates a buffer of `n` slots for the results of that function. Element ordering is not guaranteed after scatter.
 - `gather` will remove any scattering effect for the pipeline functions that follow it.
 ```typescript
 const a = await generator
