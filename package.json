@@ -5,7 +5,7 @@
   "main": "index.js",
   "scripts": {
     "test": "ts-node testing.ts",
-    "doc": "typedoc --excludePrivate --excludeExternals --stripInternal --excludeNotExported --readme none --out docs src"
+    "doc": "typedoc --theme minimal --excludePrivate --excludeExternals --stripInternal --excludeNotExported --readme none --out docs src"
   },
   "author": "Petteri Parikka",
   "license": "MIT",

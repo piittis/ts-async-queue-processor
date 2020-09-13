@@ -3,6 +3,8 @@
 
 Simple yet powerful tool for async operations. Constructs provided are `Processor` and `Pipeline`.
 
+[API doc](https://piittis.github.io/ts-async-queue-processor/)
+
 ## Processor
 A Construct that allows executing async functions while placing constraints on concurrency, throughput and allowed amount of pending functions.
 

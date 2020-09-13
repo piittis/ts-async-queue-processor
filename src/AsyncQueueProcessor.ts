@@ -19,15 +19,42 @@ export interface QueueProcessor {
 }
 
 export interface ProcessorOpts {
+  /**
+   * Maximum allowed concurrency.
+   */
   concurrency?: number;
+  /**
+   * Maximum amount of pending tasks.
+   */
   maxPending?: number;
+  /**
+   * Options for rate limiting.
+   */
   rateLimit?: LimiterOpts
 }
 
 export interface LimiterOpts {
+  /**
+   *  Throughput limit. n / second or n / minute.
+   */
   limit: [number, 'second' | 'minute'],
+  /**
+   * Tickrate of the limiter in millisecond. When rate limit is used up,
+   * this defines how often the limiter will try to open up a new slot.
+   * @default 0
+   */
   tickRate?: number;
+  /**
+   * Allow bursting. When true, up to <burstSlots> operations
+   * can burst immediately, each using up one slot.
+   * @default false
+   */
   burst?: boolean;
+  /**
+   * Maximum amount of slots for bursting.
+   * Slots are regenerated using the specified rate limit.
+   * @default same as rateLimit.limit[0]
+   */
   burstSlots?: number;
 }
 
@@ -48,11 +75,11 @@ export class AsyncQueueProcessor implements QueueProcessor {
     this.limitPending = this.maxPending !== 0;
   }
 
-  public pipe(child: QueueProcessor) {
+  public pipe(child: QueueProcessor): QueueProcessor {
     return new PipedProcessor(this, child);
   }
 
-  public with(opts: ProcessOpts) {
+  public with(opts: ProcessOpts): QueueProcessor {
     return new ProcessorWithOpts(opts, this);
   }
 
@@ -166,7 +193,6 @@ class PipedProcessor implements QueueProcessor {
   }
 }
 
-
 export type predicate<T> = (element: T, index?: number) => Promise<boolean>;
 export type syncPredicate<T> = (element: T, index?: number) => boolean;
 export type mapper<T, E> = (element: T, index?: number) => Promise<E>;
@@ -255,18 +281,30 @@ export class Pipeline<T> {
     return this;
   }
 
+  /**
+   * Has the effect, that `n` amount of generators are spawned
+   * to concurrently produce the results of the pipeline functions.
+   * The output of the generators is combined for consumption by the
+   * downstream.
+   */
   public scatter(count: number) {
     this.opts.scatterCount = count;
     this.opts.scatterOrdered = false;
     return this;
   }
 
+  /**
+   * Same as scatter, but element order is preserved.
+   */
   public scatterOrdered(count: number) {
     this.opts.scatterCount = count;
     this.opts.scatterOrdered = true;
     return this;
   }
 
+  /**
+   * Removes any scattering effect.
+   */
   public gather() {
     this.opts.scatterCount = 1;
     return this;
